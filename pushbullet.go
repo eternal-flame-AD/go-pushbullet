@@ -17,7 +17,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -387,7 +386,6 @@ func (c *Client) Pushes(after time.Time, activeOnly bool, cursor string, limit i
 		q.Add("cursor", cursor)
 	}
 	url.RawQuery = q.Encode()
-	fmt.Println(url.RequestURI())
 	req := c.buildRequest(url.RequestURI(), nil)
 	resp, err := c.Client.Do(req)
 	if err != nil {
