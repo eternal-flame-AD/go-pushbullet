@@ -17,9 +17,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"strconv"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // ErrDeviceNotFound is raised when device nickname is not found on pusbullet server
@@ -40,6 +45,121 @@ type Client struct {
 	Endpoint
 }
 
+type Listener struct {
+	Ephemeral <-chan *EphemeralPush
+	Push      <-chan *Push
+	Device    <-chan *Device
+	Error     <-chan error
+	Close     chan<- struct{}
+	Updated   time.Time
+}
+
+func (c *Client) Listen() *Listener {
+	u := url.URL{
+		Scheme: "wss",
+		Host:   "stream.pushbullet.com",
+		Path:   "/websocket/" + c.Key,
+	}
+	cache := 10
+	ephemeral := make(chan *EphemeralPush, cache)
+	pushc := make(chan *Push, cache)
+	devicec := make(chan *Device, cache)
+	errorc := make(chan error, cache)
+	nclose := make(chan struct{}, 1)
+	listener := &Listener{
+		ephemeral, pushc, devicec, errorc, nclose, time.Now(),
+	}
+	go func() {
+		connect := func() *websocket.Conn {
+			conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+			if err != nil {
+				errorc <- err
+			}
+			return conn
+		}
+		update := func(new time.Time) {
+			listener.Updated = new
+		}
+		conn := connect()
+		for {
+			conn.SetReadDeadline(time.Now().Add(time.Minute))
+			_, r, err := conn.NextReader()
+			if err != nil {
+				errorc <- err
+				conn = connect()
+				continue
+			}
+			msg, err := ioutil.ReadAll(r)
+			if err != nil {
+				errorc <- err
+				conn = connect()
+				continue
+			}
+			data := struct {
+				Type    string         `json:"type"`
+				Subtype string         `json:"subtype"`
+				Push    *EphemeralPush `json:"push"`
+			}{}
+			json.Unmarshal(msg, &data)
+			switch data.Type {
+			case "nop":
+			case "tickle":
+				switch data.Subtype {
+				case "push":
+					pushes, err := c.Pushes(listener.Updated, false, "", 0)
+					if err != nil {
+						errorc <- err
+					}
+					if len(pushes) == 0 {
+						continue
+					}
+					newest := pushes[0].Modified
+					for _, push := range pushes {
+						if int64(push.Modified) > listener.Updated.Unix() {
+							pushc <- push
+						}
+						if push.Modified > newest {
+							newest = push.Modified
+						}
+					}
+					update(time.Unix(int64(newest), 0))
+				case "device":
+					devices, err := c.Devices()
+					if err != nil {
+						errorc <- err
+					}
+					if len(devices) == 0 {
+						continue
+					}
+					newest := devices[0].Modified
+					for _, device := range devices {
+						if int64(device.Modified) > listener.Updated.Unix() {
+							devicec <- device
+						}
+						if device.Modified > newest {
+							newest = device.Modified
+						}
+					}
+					update(time.Unix(int64(newest), 0))
+				}
+			case "push":
+				ephemeral <- data.Push
+			}
+			select {
+			case <-nclose:
+				close(pushc)
+				close(ephemeral)
+				close(errorc)
+				close(nclose)
+				close(devicec)
+				break
+			default:
+			}
+		}
+	}()
+	return listener
+}
+
 // New creates a new client with your personal API key.
 func New(apikey string) *Client {
 	endpoint := Endpoint{URL: EndpointURL}
@@ -56,8 +176,8 @@ func NewWithClient(apikey string, client *http.Client) *Client {
 type Device struct {
 	Iden              string  `json:"iden"`
 	Active            bool    `json:"active"`
-	Created           float32 `json:"created"`
-	Modified          float32 `json:"modified"`
+	Created           float64 `json:"created"`
+	Modified          float64 `json:"modified"`
 	Icon              string  `json:"icon"`
 	Nickname          string  `json:"nickname"`
 	GeneratedNickname bool    `json:"generated_nickname"`
@@ -219,6 +339,83 @@ func (c *Client) Me() (*User, error) {
 		return nil, err
 	}
 	return &userResponse, nil
+}
+
+type Push struct {
+	Active                  bool     `json:"active"`
+	Dismissed               bool     `json:"dismissed"`
+	Iden                    string   `json:"iden"`
+	Type                    string   `json:"type"`
+	Created                 float64  `json:"created"`
+	Modified                float64  `json:"modified"`
+	GUID                    string   `json:"guid"`
+	Direction               string   `json:"direction"`
+	SenderIden              string   `json:"sender_iden"`
+	SenderEmail             string   `json:"sender_email"`
+	SenderEmailNormalized   string   `json:"sender_email_normalized"`
+	SenderName              string   `json:"sender_name"`
+	ReceiverIden            string   `json:"receiver_iden"`
+	ReceiverEmail           string   `json:"receiver_email"`
+	ReceiverEmailNormalized string   `json:"receiver_email_normalized"`
+	TargetDeviceIden        string   `json:"target_device_iden"`
+	SenderDeciveIden        string   `json:"sender_device_iden"`
+	ClientIden              string   `json:"client_iden"`
+	ChannelIden             string   `json:"channel_iden"`
+	AwakeAppGUIDs           []string `json:"awake_app_guids"`
+	Title                   string   `json:"title"`
+	Body                    string   `json:"body"`
+	URL                     string   `json:"url"`
+	FileName                string   `json:"file_name"`
+	FileMIME                string   `json:"file_type"`
+	FileURL                 string   `json:"file_url"`
+	ImageURL                string   `json:"image_url"`
+	ImageHeight             int      `json:"image_height"`
+	ImageWidth              int      `json:"image_width"`
+}
+
+func (c *Client) Pushes(after time.Time, activeOnly bool, cursor string, limit int) ([]*Push, error) {
+	url := url.URL{
+		Path: "/pushes",
+	}
+	q := url.Query()
+	q.Add("modified_after", strconv.FormatInt(after.Unix(), 10))
+	q.Add("active", strconv.FormatBool(activeOnly))
+	if limit > 0 {
+		q.Add("limit", strconv.FormatInt(int64(limit), 10))
+	}
+	if cursor != "" {
+		q.Add("cursor", cursor)
+	}
+	url.RawQuery = q.Encode()
+	fmt.Println(url.RequestURI())
+	req := c.buildRequest(url.RequestURI(), nil)
+	resp, err := c.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var errResponse errorResponse
+		dec := json.NewDecoder(resp.Body)
+		err = dec.Decode(&errResponse)
+		if err == nil {
+			return nil, &errResponse.ErrResponse
+		}
+
+		return nil, errors.New(resp.Status)
+	}
+	res := struct {
+		Pushes []*Push `json:"pushes"`
+	}{}
+	data, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	err = json.Unmarshal(data, &res)
+	if err != nil {
+		return nil, err
+	}
+	return res.Pushes, nil
 }
 
 // Push pushes the data to a specific device registered with PushBullet.  The
